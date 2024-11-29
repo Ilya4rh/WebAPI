@@ -118,7 +118,7 @@ async def get_product(product_id: int, db: AsyncSession = Depends(get_db)):
 
 
 # Асинхронный эндпоинт для получения информации об одном товаре по Коду товара
-@app.get("/api/products/{product_id}", response_model=Product)
+@app.get("/api/products/{product_code}", response_model=Product)
 async def get_product(product_code: int, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(ProductDB).filter(ProductDB.code == product_code))
     product = result.scalar_one_or_none()
