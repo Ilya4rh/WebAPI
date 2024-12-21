@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, BackgroundTasks
+from fastapi import FastAPI, Depends, BackgroundTasks, WebSocket, HTTPException
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,6 +10,26 @@ from parser import get_all_products_info
 from pydantic import BaseModel
 from typing import AsyncGenerator
 import asyncio
+import datetime
+from starlette.websockets import WebSocketDisconnect
+import json
+
+
+class ConnectionManager:
+    def __init__(self):
+        self.connections: list[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.connections.append(websocket)
+
+    async def broadcast(self, data: str):
+        for connect in self.connections:
+            await connect.send_text(data);
+
+
+
+manager = ConnectionManager();
 
 
 # Функция выполняющаяся при запуске приложения и управляющая его жизненным циклом
@@ -42,10 +62,11 @@ async def background_parser_async(delay_in_second: int):
         while True:
             # Указываем время задержки работы
             await asyncio.sleep(delay_in_second)
-            print("Parser start.")
+            print(f"Parser start. Time start: {datetime.datetime.now().time()}")
             # Запускаем парсер
             products = await parser(db)
-            print(f"Parser end. Add {len(products)} products")
+            print(f"Parser end. Add {len(products)} products. Time end: {datetime.datetime.now().time()}")
+            await manager.broadcast(f"Background parser parsed {len(products)} products")
 
 
 # Асинхронная функция парсера
@@ -101,12 +122,15 @@ class Product(ProductBase):
 async def get_products(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(ProductDB))
     products = result.scalars().all()
+
+    await manager.broadcast(f"Get Products: {json.dumps([product.to_dict() for product in products], ensure_ascii=False)}")
+
     return products
 
 
 # Асинхронный эндпоинт для получения информации об одном товаре по Id
 @app.get("/api/products/{product_id}", response_model=Product)
-async def get_product(product_id: int, db: AsyncSession = Depends(get_db)):
+async def get_product_by_id(product_id: int, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(ProductDB).filter(ProductDB.id == product_id))
     product = result.scalar_one_or_none()
 
@@ -114,18 +138,7 @@ async def get_product(product_id: int, db: AsyncSession = Depends(get_db)):
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
 
-    return product
-
-
-# Асинхронный эндпоинт для получения информации об одном товаре по Коду товара
-@app.get("/api/products/{product_code}", response_model=Product)
-async def get_product(product_code: int, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(ProductDB).filter(ProductDB.code == product_code))
-    product = result.scalar_one_or_none()
-
-    # Если товар не найден, то кидаем 404, с соответствующим сообщением
-    if not product:
-        raise HTTPException(status_code=404, detail="Product not found")
+    await manager.broadcast(f"Get Product by Id: {json.dumps(product.to_dict(), ensure_ascii=False)}")
 
     return product
 
@@ -144,6 +157,9 @@ async def add_product(product: ProductCreate, db: AsyncSession = Depends(get_db)
         existing_product.currency = product.currency
         await db.commit()
         await db.refresh(existing_product)
+
+        await manager.broadcast(f"Change Product: {json.dumps(db_product.to_dict(), ensure_ascii=False)}")
+
         return existing_product
 
     # Иначе добавляем новый товар в базу данных
@@ -153,16 +169,20 @@ async def add_product(product: ProductCreate, db: AsyncSession = Depends(get_db)
     await db.commit()
     await db.refresh(db_product)
 
+    await manager.broadcast(f"Add Product: {json.dumps(db_product.to_dict(), ensure_ascii=False)}")
+
     return db_product
 
 
 # Асинхронный эндпоинт для запуска парсера один раз
-@app.post("/api/run_parser_once")
+@app.post("/api/products/run_parser_once", response_model=dict)
 async def run_parser_once(db: AsyncSession = Depends(get_db)):
     # Получаем все товары с сайта, запуская парсер
     all_products = await parser(db)
 
-    return {"message": f"{len(all_products)} products have been added."}
+    await manager.broadcast(f"Parsed {len(all_products)} products")
+
+    return { "message": f"{len(all_products)} products have been added." }
 
 
 # Асинхронный эндпоинт для изменения полей товара по Id
@@ -183,6 +203,9 @@ async def сhange_product(product_id: int, product: ProductCreate, db: AsyncSess
     existing_product.currency = product.currency
     await db.commit()
     await db.refresh(existing_product)
+
+    await manager.broadcast(f"Change Product: {json.dumps(existing_product.to_dict(), ensure_ascii=False)}")
+
     return existing_product
 
 
@@ -199,4 +222,24 @@ async def delete_product(product_id: int, db: AsyncSession = Depends(get_db)):
     await db.delete(existing_product)
     await db.commit()
 
+    await manager.broadcast(f"Delete Product: {json.dumps(existing_product.to_dict(), ensure_ascii=False)}")
+
     return {"message": f"Product with Id '{product_id}' has been deleted."}
+
+
+@app.websocket("/websocket")
+async def websocket_endpoint(websocket: WebSocket, db: AsyncSession = Depends(get_db)):
+    await manager.connect(websocket)
+
+    try:
+        while True:
+            data = await websocket.receive_text()
+            if data == "get_products":
+                result = await db.execute(select(ProductDB))
+                products = result.scalars().all()
+                response = json.dumps([product.to_dict() for product in products], ensure_ascii=False)
+                await websocket.send_text(response)
+                continue
+            await websocket.send_text(data)
+    except WebSocketDisconnect:
+        print(f"Client {websocket} disconnected")

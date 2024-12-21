@@ -16,3 +16,13 @@ class ProductDB(Base):
         self.name = name
         self.price = price
         self.currency = currency
+
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "code": self.code,
+            "name": self.name,
+            "price": self.price,
+            "currency": self.currency
+        }
